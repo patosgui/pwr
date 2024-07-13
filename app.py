@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+
+# Copyright Muxup contributors.
+# Distributed under the terms of the MIT license, see LICENSE for details.
+# SPDX-License-Identifier: MIT
+
+import streamlit as st
+import datetime
+import pandas as pd
+import itertools
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+from typing import Callable, TypedDict
+
+import requests
+from bs4 import BeautifulSoup
+
+### Type definitions ###
+
+URLAndTitleList = list[list[str]]
+
+
+class SourceData(TypedDict):
+    seen: list[str]
+    entries: URLAndTitleList
+
+
+class PWRData(TypedDict):
+    last_read: str
+    last_fetch: str
+    last_filter: str
+    sources: dict[str, SourceData]
+
+
+### Config ###
+
+# Wrapped in a function to workaround Python's lack of support for forward
+# declarations of functions (such as the referenced fetcher functions)
+# fmt: off
+def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]:
+    return {
+        "Rust Internals": (discourse_fetcher, "https://internals.rust-lang.org/"),
+        "HN": (feed_fetcher, "https://news.ycombinator.com/rss", True),
+        "lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
+        "/r/programminglanguages": (feed_fetcher, "http://www.reddit.com/r/programminglanguages/.rss"),
+        "/r/rust": (feed_fetcher, "http://www.reddit.com/r/rust/top.rss?t=week"),
+        "Muxup": (feed_fetcher, "https://muxup.com/feed.xml"),
+        "Igalia": (feed_fetcher, "https://www.igalia.com/feed.xml"),
+        "cs.PL": (arxiv_fetcher, "cs.PL"),
+        "cs.AR": (arxiv_fetcher, "cs.AR"),
+        "Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
+        "RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
+        #"Nim forum": (nimforum_fetcher,),
+    }
+# fmt: on
+
+
+# URLs that will be opened unconditionally when performing the 'read' action.
+extra_urls_for_read = ["https://guardian.co.uk"]
+data_dir = Path(
+    os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share" / "pwr")
+)
+data_file = data_dir / "data.json"
+preferred_browser = os.environ.get("BROWSER", "firefox")
+saved_seen_url_limit = 250
+fetch_timeout = 10
+read_url_batch_size = 10
+
+
+### Fetchers ###
+
+# A fetcher is passed whatever arguments were present in the sources
+# dictionary, and is responsible for returning an array of [url, title]
+# arrays. The caller will take care of removing any [url, title] entries where
+# the url has already been seen. A fetcher might append `##someval` to a URL
+# to force it appear fresh (where someval might be a timestamp, number of
+# replies, or some other data).
+
+
+def feed_fetcher(url: str, comments_as_link: bool = False) -> URLAndTitleList:
+    soup = BeautifulSoup(fetch_from_url(url), features="xml")
+    entries = soup.find_all(["item", "entry"])
+    extracted = []
+    for entry in entries:
+        title = entry.find("title").text
+        link = entry.find(comments_as_link and "comments" or "link")
+        url = link.get("href") or link.text
+        extracted.append([url, title])
+    return extracted
+
+
+# Custom fetcher rather than just using the RSS feed because the arXiv RSS
+# feeds only include any papers posted in the last day, so it's possible to
+# miss them if you don't fetch regularly enough.
+def arxiv_fetcher(category: str) -> URLAndTitleList:
+    url = f"https://arxiv.org/list/{category}/recent"
+    soup = BeautifulSoup(fetch_from_url(url), "html.parser")
+    extracted = []
+
+    for dt in soup.find_all("dt"):
+        title_tag = dt.find_next("div", class_="list-title")
+        title = title_tag.text.replace("Title:", "").strip()
+        abstract = dt.find_next("a", title="Abstract")
+        url = "https://arxiv.org" + abstract["href"]
+        extracted.append([url, title])
+    return extracted
+
+
+# The Discourse RSS feeds don't provide the same listing as when viewing a
+# category sorted by most recently replied to (see
+# <https://meta.discourse.org/t/missing-rss-feed-which-corresponds-to-new-topics/295686>), so extract it ourselves.
+def discourse_fetcher(url: str) -> URLAndTitleList:
+    soup = BeautifulSoup(fetch_from_url(url), "html.parser")
+    extracted = []
+
+    topics = soup.find_all("tr", class_="topic-list-item")
+    for topic in topics:
+        title_tag = topic.find("a", class_="title")
+        title = title_tag.text.strip()
+        url = title_tag.get("href")
+        replies = topic.find("span", class_="posts").text.strip()
+        extracted.append([f"{url}##{replies}", append_replies(title, int(replies))])
+    return extracted
+
+
+def ghdiscussions_fetcher(ghpath: str) -> URLAndTitleList:
+    soup = BeautifulSoup(
+        fetch_from_url(f"https://github.com/{ghpath}/discussions"), "html.parser"
+    )
+    extracted = []
+
+    for topic in soup.find_all("a", attrs={"data-hovercard-type": "discussion"}):
+        title = topic.text.strip()
+        url = f"https://github.com{topic.get('href')}"
+        replies_element = topic.find_next(
+            "a", attrs={"aria-label": lambda x: x and "comment" in x}
+        )
+        replies = replies_element.text.strip()
+        extracted.append([f"{url}##{replies}", append_replies(title, int(replies))])
+    return extracted
+
+
+def groupsio_fetcher(groupurl: str) -> URLAndTitleList:
+    soup = BeautifulSoup(fetch_from_url(groupurl), "html.parser")
+    extracted = []
+    for topic_span in soup.find_all("span", class_="subject"):
+        link = topic_span.find("a")
+        title = link.text.strip()
+        url = link.get("href")
+        reply_count_span = topic_span.find("span", class_="hashtag-position")
+        reply_count = reply_count_span.text.strip() if reply_count_span else "0"
+        extracted.append(
+            [f"{url}##{reply_count}", append_replies(title, int(reply_count))]
+        )
+    return extracted
+
+
+def nimforum_fetcher() -> URLAndTitleList:
+    thread_data = json.loads(fetch_from_url("https://forum.nim-lang.org/threads.json"))
+    extracted = []
+    for thread in thread_data["threads"]:
+        extracted.append(
+            [
+                f"https://forum.nim-lang.org/t/{thread['id']}##{thread['replies']}",
+                append_replies(thread["topic"], thread["replies"]),
+            ]
+        )
+    return extracted
+
+
+### Helper functions ###
+
+
+def append_replies(title: str, count: int) -> str:
+    if count == 1:
+        return f"{title} (1 reply)"
+    return f"{title} ({count} replies)"
+
+
+def load_data() -> PWRData:
+    # if data_file.exists():
+    #    return json.loads(data_file.read_text())  # type: ignore
+    return {
+        "last_read": "Never",
+        "last_fetch": "Never",
+        "last_filter": "Never",
+        "sources": {},
+    }
+
+
+def save_data(data: PWRData) -> None:
+    data_file.write_text(json.dumps(data, indent=2))
+
+
+def fetch_from_url(url: str, max_retries: int = 5, delay: int = 1) -> str:
+    headers = {"User-Agent": "pwr - paced web reader"}
+    for attempt in range(max_retries):
+        try:
+            print(f"Fetching {url} ...", end="", flush=True)
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            print("DONE")
+            return response.text
+        except requests.exceptions.HTTPError as e:
+            print(f"FAILED {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 4
+    print("Max retries reached. Giving up.")
+    sys.exit(1)
+
+
+def get_time() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def print_help() -> None:
+    print("Usage: pwr [action]")
+    print("\nIf no action is given, cycles through read/fetch/filter in sequence.\n")
+    print("Available actions:")
+    print("  read   - Read previously selected/enqueued URls")
+    print("  fetch  - Retrieve new article titles for review")
+    print("  filter - Review article titles and decide which to read")
+    print("  status - Print information about current status")
+
+
+def speedbump(action_name: str, data: PWRData) -> None:
+    print(f"About to start pwr {action_name}, last run at: {data['last_'+action_name]}")  # type: ignore
+    input(f"Press Enter to continue with pwr {action_name}")
+
+
+def get_last_action(data: PWRData) -> tuple[str, str]:
+    def date_str_for_op(key: str) -> str:
+        val = data[key]  # type: ignore
+        if val == "Never":
+            return "1970-01-01 00:00:00 UTC"
+        return val  # type: ignore
+
+    recent_ops = [
+        ("read", date_str_for_op("last_read")),
+        ("fetch", date_str_for_op("last_fetch")),
+        ("filter", date_str_for_op("last_filter")),
+    ]
+    last_action, last_action_datetime = max(recent_ops, key=lambda x: x[1])
+    return (last_action, last_action_datetime)
+
+
+def count_urls(data: PWRData) -> int:
+    return sum(len(source_data["entries"]) for source_data in data["sources"].values())
+
+
+### Action implementations ###
+
+
+def do_read() -> None:
+    data = load_data()
+    last_action, _ = get_last_action(data)
+    speedbump("read", data)
+    if last_action != "filter":
+        print(
+            "WARNING: filter is not the most recent action. Did you forget to run it?"
+        )
+        input("Press Enter to continue anyway, or Ctrl-C to abort")
+    urls = extra_urls_for_read.copy()
+
+    for source_data in data["sources"].values():
+        for url, _ in source_data["entries"]:
+            url = url.split("##")[0]
+            if not url.startswith(("http://", "https://")):
+                print(f"Skipping url '{url}' as it doesn't have a recognised protocol")
+                continue
+            urls.append(url)
+        source_data["entries"] = []
+
+    print(
+        f"Launching browser (in batches of {read_url_batch_size}) for {len(urls)} URLs."
+    )
+
+    for url_batch in itertools.batched(urls, read_url_batch_size):
+        print(f"Opening batch of URLs with browser {preferred_browser}")
+        print(url_batch)
+        subprocess.Popen([preferred_browser] + list(url_batch))
+        if len(url_batch) == read_url_batch_size:
+            input("Press Enter to continue to next batch")
+
+    print("All URLs read, saving changes")
+    data["last_read"] = get_time()
+    save_data(data)
+    print(f"pwr read ended successfully at {data['last_read']}")
+
+
+def do_fetch():
+    data = load_data()
+    # speedbump("fetch", data)
+    total_filtered_extracted = 0
+
+    all_filtered_extracted = []
+    for source_name, source_info in get_sources().items():
+        if source_name not in data["sources"]:
+            data["sources"][source_name] = {"seen": [], "entries": []}
+        else:
+            # Ensure serialised order of data from fetchers reflects any
+            # changes made to the sources dict order.
+            value = data["sources"].pop(source_name)
+            data["sources"][source_name] = value
+
+        print(f"Processing source {source_name}")
+        func = source_info[0]
+        extracted = func(*source_info[1:])
+
+        saved_source_data = data["sources"][source_name]
+        saved_source_data["seen"] = saved_source_data["seen"][-saved_seen_url_limit:]
+        seen_set = dict.fromkeys(saved_source_data["seen"])
+        filtered_extracted = []
+        for url, title in extracted:
+            if url in seen_set:
+                # Ensure entry in seen_set is refreshed (i.e. affect ordering)
+                seen_set.pop(url)
+            else:
+                filtered_extracted.append([url, title])
+            seen_set[url] = None
+        saved_source_data["seen"] = list(seen_set.keys())
+
+        for extract in filtered_extracted:
+            extract.append(source_name)
+
+        saved_source_data["entries"].extend(filtered_extracted)
+        all_filtered_extracted.extend(filtered_extracted)
+        total_filtered_extracted += len(filtered_extracted)
+        print(
+            f"Retrieved {len(extracted)} items, {len(filtered_extracted)} remain after removing seen items"
+        )
+
+    # Delete data for any sources no longer in the sources list in this
+    # script.
+    sources = get_sources()
+    for source_name in list(data["sources"].keys()):
+        if source_name not in sources:
+            del data["sources"][source_name]
+
+    data["last_fetch"] = get_time()
+    save_data(data)
+    print(
+        f"\nA total of {total_filtered_extracted} items were queued up for filtering."
+    )
+    print(f"pwr fetch ended successfully at {data['last_fetch']}")
+    return all_filtered_extracted
+
+
+def get_selected_items():
+    st.write(st.session_state["all_entries"])
+
+
+def make_clickable(url, text):
+    return f'<a target="_blank" href="{url}">{text}</a>'
+
+
+def dataframe_with_selections(
+    df: pd.DataFrame, init_value: bool = False
+) -> pd.DataFrame:
+    df_with_selections = df.copy()
+    df_with_selections.insert(0, "Select", init_value)
+
+    # Apply the make_clickable function to the link column
+    print(df_with_selections)
+
+    # Get dataframe row-selections from user with st.data_editor
+    edited_df = st.data_editor(
+        df_with_selections,
+        key="all_entries",
+        hide_index=True,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(required=True),
+            "URL": st.column_config.LinkColumn(),
+        },
+        disabled=df.columns,
+        on_change=get_selected_items,
+    )
+
+    # Filter the dataframe using the temporary column, then drop the column
+    selected_rows = edited_df[edited_df.Select]
+    return selected_rows.drop("Select", axis=1)
+
+
+def do_filter() -> None:
+    data = load_data()
+    speedbump("filter", data)
+    num_urls_before_filtering = count_urls(data)
+    wrapper = textwrap.TextWrapper(
+        width=98, initial_indent="d ", subsequent_indent="  "
+    )
+    filter_file = data_dir / "filter.pwr"
+
+    with filter_file.open("w") as file:
+        file.write("------------------------------------------------------------\n")
+        file.write(f"Filter file generated at {get_time()}\n")
+        file.write("DO NOT DELETE OR MOVE ANY LINES\n")
+        file.write("To mark an item for reading, replace the 'd' prefix with 'r'\n")
+        file.write("Exit editor with non-zero return code (:cq in vim) to abort\n")
+        file.write("------------------------------------------------------------\n\n")
+        for source_name, source_data in data["sources"].items():
+            if not source_data["entries"]:
+                continue
+            file.write(f"# {source_name}\n")
+            for _, title in source_data["entries"]:
+                file.write(wrapper.fill(title))
+                file.write("\n")
+            file.write("\n")
+
+    result = subprocess.run([os.environ.get("EDITOR", "vim"), filter_file])
+    if result.returncode != 0:
+        print("Exiting early as editor returned non-zero exit code")
+        print("Filtering not applied")
+        sys.exit(1)
+
+    with filter_file.open("r") as file:
+        filtered_entries: URLAndTitleList = []
+        cur_source_name = None
+        index = 0
+
+        for line in file:
+            if line.startswith("# "):
+                new_source_name = line[2:].strip()
+                if new_source_name not in data["sources"]:
+                    raise ValueError(
+                        f"Source {new_source_name} not found in saved json"
+                    )
+                if cur_source_name:
+                    data["sources"][cur_source_name]["entries"] = filtered_entries
+                filtered_entries = []
+                index = 0
+                cur_source_name = new_source_name
+            elif line.startswith("d "):
+                index += 1
+            elif line.startswith("r "):
+                if not cur_source_name:
+                    raise ValueError(
+                        "Invalid input. 'r ' encountered with no preceding heading."
+                    )
+
+                filtered_entries.append(
+                    data["sources"][cur_source_name]["entries"][index]
+                )
+                index += 1
+
+        if cur_source_name:
+            data["sources"][cur_source_name]["entries"] = filtered_entries
+
+    num_urls_after_filtering = count_urls(data)
+    print(
+        f"Filtered {num_urls_before_filtering} entries down to {num_urls_after_filtering} ({num_urls_before_filtering - num_urls_after_filtering} removed)."
+    )
+    data["last_filter"] = get_time()
+    save_data(data)
+    print(f"pwr filter ended successfully at {data['last_filter']}")
+
+
+def do_status() -> None:
+    data = load_data()
+    last_action, last_action_datetime = get_last_action(data)
+    print(f"Last operation was '{last_action}' at {last_action_datetime}")
+    print(f"{count_urls(data)} items in entries database")
+
+
+def do_test_fetcher(name: str, args: list[str]) -> None:
+    fetcher_fn = globals().get(f"{name}_fetcher")
+    if not fetcher_fn or not callable(fetcher_fn):
+        print(f"Error: fetcher function '{name}' not found.")
+        sys.exit(1)
+    extracted = fetcher_fn(*args)
+    print(f"{len(extracted)} URL+title pairs extracted:\n")
+    for entry in extracted:
+        print(f"URL: {entry[0]}")
+        print(f"Title: {entry[1]}")
+        print()
+
+
+### Main ###
+
+if __name__ == "__main__":
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    data = do_fetch()
+    print(data)
+    df = pd.DataFrame(data, columns=["URL", "Title", "Source"])
+    new_order = ["Source", "Title", "URL"]
+    df = df[new_order]
+    selection = dataframe_with_selections(df)
+    st.write("Your selection:")
+    st.write(selection)
