@@ -43,7 +43,6 @@ class PWRData(TypedDict):
 def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]:
     return {
         "Rust Internals": (discourse_fetcher, "https://internals.rust-lang.org/"),
-        "Swift Evolution": (discourse_fetcher, "https://forums.swift.org/c/evolution/18"),
         "HN": (feed_fetcher, "https://news.ycombinator.com/rss", True),
         "lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
         "/r/programminglanguages": (feed_fetcher, "http://www.reddit.com/r/programminglanguages/.rss"),
@@ -282,6 +281,7 @@ def do_read() -> None:
 
     for url_batch in itertools.batched(urls, read_url_batch_size):
         print(f"Opening batch of URLs with browser {preferred_browser}")
+        print(url_batch)
         subprocess.Popen([preferred_browser] + list(url_batch))
         if len(url_batch) == read_url_batch_size:
             input("Press Enter to continue to next batch")
