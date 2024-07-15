@@ -12,7 +12,6 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 from typing import Callable, TypedDict
@@ -44,9 +43,9 @@ class PWRData(TypedDict):
 # fmt: off
 def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]:
     return {
-        "Rust Internals": (discourse_fetcher, "https://internals.rust-lang.org/"),
+        #"Rust Internals": (discourse_fetcher, "https://internals.rust-lang.org/"),
         "HN": (feed_fetcher, "https://news.ycombinator.com/rss", True),
-        "lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
+        #"lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
         "/r/programminglanguages": (feed_fetcher, "http://www.reddit.com/r/programminglanguages/.rss"),
         "/r/rust": (feed_fetcher, "http://www.reddit.com/r/rust/top.rss?t=week"),
         "Muxup": (feed_fetcher, "https://muxup.com/feed.xml"),
@@ -55,7 +54,7 @@ def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[obje
         "cs.AR": (arxiv_fetcher, "cs.AR"),
         "Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
         "RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
-        #"Nim forum": (nimforum_fetcher,),
+        "Nim forum": (nimforum_fetcher,),
     }
 # fmt: on
 
@@ -294,188 +293,109 @@ def do_read() -> None:
     print(f"pwr read ended successfully at {data['last_read']}")
 
 
-def do_fetch():
-    data = load_data()
-    total_filtered_extracted = 0
+class URLCache:
+    filename: Path
+    data: dict[str, list[str]]
+    max_entries: int
 
-    all_filtered_extracted = []
-    for source_name, source_info in get_sources().items():
-        if source_name not in data["sources"]:
-            data["sources"][source_name] = {"seen": [], "entries": []}
+    def __init__(self, filename, max_entries=500):
+        self.filename = filename
+        self.data = dict()
+        max_entries = max_entries
+
+        if self.filename.exists():
+            print(f"Loading URLs from cache at {self.filename}")
+            with open(self.filename, "r") as f:
+                self.data = json.load(f)
         else:
-            # Ensure serialised order of data from fetchers reflects any
-            # changes made to the sources dict order.
-            value = data["sources"].pop(source_name)
-            data["sources"][source_name] = value
+            print(f"Created new cache at {self.filename}")
+            self.filename.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.filename, "w") as f:
+                self.data["urls"] = []
+                self.filename.write_text(json.dumps(self.data))
 
+    def save(self) -> None:
+        self.filename.write_text(json.dumps(self.data))
+
+    def add(self, url: str) -> bool:
+        if url not in self.data["urls"]:
+            self.data["urls"].append(url)
+            self.save()  # This is heavy but performance is not an issue
+            return True
+
+        return False
+
+
+def do_fetch(url_cache: URLCache):
+    # [[url,title,source_name]]
+    returned_urls: list[list[str]] = []
+    total_filtered_extracted = 0
+    for source_name, source_info in get_sources().items():
         print(f"Processing source {source_name}")
+
         func = source_info[0]
         extracted = func(*source_info[1:])
 
-        saved_source_data = data["sources"][source_name]
-        saved_source_data["seen"] = saved_source_data["seen"][-saved_seen_url_limit:]
-        seen_set = dict.fromkeys(saved_source_data["seen"])
-        filtered_extracted = []
-        for url, title in extracted:
-            if url in seen_set:
-                # Ensure entry in seen_set is refreshed (i.e. affect ordering)
-                seen_set.pop(url)
-            else:
-                filtered_extracted.append([url, title])
-            seen_set[url] = None
-        saved_source_data["seen"] = list(seen_set.keys())
+        filtered = [
+            [source_name, title, url] for url, title in extracted if url_cache.add(url)
+        ]
 
-        for extract in filtered_extracted:
-            extract.append(source_name)
-
-        saved_source_data["entries"].extend(filtered_extracted)
-        all_filtered_extracted.extend(filtered_extracted)
-        total_filtered_extracted += len(filtered_extracted)
+        returned_urls.extend(filtered)
+        total_filtered_extracted += len(filtered)
         print(
-            f"Retrieved {len(extracted)} items, {len(filtered_extracted)} remain after removing seen items"
+            f"Retrieved {len(extracted)} items, {len(filtered)} remain after removing seen items"
         )
 
-    # Delete data for any sources no longer in the sources list in this
-    # script.
-    sources = get_sources()
-    for source_name in list(data["sources"].keys()):
-        if source_name not in sources:
-            del data["sources"][source_name]
-
-    data["last_fetch"] = get_time()
-    save_data(data)
     print(
         f"\nA total of {total_filtered_extracted} items were queued up for filtering."
     )
-    print(f"pwr fetch ended successfully at {data['last_fetch']}")
-    return all_filtered_extracted
+
+    return pd.DataFrame(returned_urls, columns=["Source", "Title", "URL"])
 
 
-def get_selected_items():
-    st.write(st.session_state["all_entries"])
+def get_selected_items(key: str):
+    return
+    st.write(st.session_state[key])
 
 
-def dataframe_with_selections(
-    df: pd.DataFrame, init_value: bool = False
-) -> pd.DataFrame:
+def streamlit_data_editors(df: pd.DataFrame, init_value: bool = False) -> pd.DataFrame:
+    """
+    Return the dataframes that are generated by streamlit to keep the data alive
+    """
     df_with_selections = df.copy()
     df_with_selections.insert(0, "Select", init_value)
 
-    original = df_with_selections.copy()
+    sources = df_with_selections["Source"].unique()
 
     # Apply the make_clickable function to the link column
     print(df_with_selections)
 
-    df_with_selections = df_with_selections[
-        df_with_selections.Source == "Rust Internals"
-    ]
+    dataframes = []
+    for source in sources:
+        print(source)
+        source_df = df_with_selections[df_with_selections.Source == source].copy()
+        source_df = source_df.drop(columns=["Source"])
 
-    st.subheader("Rust Internals")
-    # Get dataframe row-selections from user with st.data_editor
-    edited_df = st.data_editor(
-        df_with_selections,
-        key="all_entries",
-        hide_index=True,
-        column_config={
-            "Select": st.column_config.CheckboxColumn(required=True),
-            "URL": st.column_config.LinkColumn(),
-        },
-        disabled=df.columns,
-        on_change=get_selected_items,
-    )
+        st.subheader(source)
+        edited_df = st.data_editor(
+            source_df,
+            key=source,
+            hide_index=True,
+            column_config={
+                "Select": st.column_config.CheckboxColumn(required=True),
+                "URL": st.column_config.LinkColumn(),
+            },
+            disabled=df.columns,
+            on_change=get_selected_items,
+            args=(source,),
+        )
 
-    df_with_selections = original[original.Source == "HN"]
-    st.subheader("HN")
-    # Get dataframe row-selections from user with st.data_editor
-    edited_df_2 = st.data_editor(
-        df_with_selections,
-        key="all_entries_2",
-        hide_index=True,
-        column_config={
-            "Select": st.column_config.CheckboxColumn(required=True),
-            "URL": st.column_config.LinkColumn(),
-        },
-        disabled=df.columns,
-        on_change=get_selected_items,
-    )
+        # Filter the dataframe using the temporary column, then drop the column
+        selected_rows = edited_df[edited_df.Select]
+        selected_rows.drop("Select", axis=1)
+        dataframes.append(selected_rows)
 
-    # Filter the dataframe using the temporary column, then drop the column
-    selected_rows = edited_df[edited_df.Select]
-    selected_rows = edited_df_2[edited_df_2.Select]
-    return selected_rows.drop("Select", axis=1)
-
-
-def do_filter() -> None:
-    data = load_data()
-    speedbump("filter", data)
-    num_urls_before_filtering = count_urls(data)
-    wrapper = textwrap.TextWrapper(
-        width=98, initial_indent="d ", subsequent_indent="  "
-    )
-    filter_file = data_dir / "filter.pwr"
-
-    with filter_file.open("w") as file:
-        file.write("------------------------------------------------------------\n")
-        file.write(f"Filter file generated at {get_time()}\n")
-        file.write("DO NOT DELETE OR MOVE ANY LINES\n")
-        file.write("To mark an item for reading, replace the 'd' prefix with 'r'\n")
-        file.write("Exit editor with non-zero return code (:cq in vim) to abort\n")
-        file.write("------------------------------------------------------------\n\n")
-        for source_name, source_data in data["sources"].items():
-            if not source_data["entries"]:
-                continue
-            file.write(f"# {source_name}\n")
-            for _, title in source_data["entries"]:
-                file.write(wrapper.fill(title))
-                file.write("\n")
-            file.write("\n")
-
-    result = subprocess.run([os.environ.get("EDITOR", "vim"), filter_file])
-    if result.returncode != 0:
-        print("Exiting early as editor returned non-zero exit code")
-        print("Filtering not applied")
-        sys.exit(1)
-
-    with filter_file.open("r") as file:
-        filtered_entries: URLAndTitleList = []
-        cur_source_name = None
-        index = 0
-
-        for line in file:
-            if line.startswith("# "):
-                new_source_name = line[2:].strip()
-                if new_source_name not in data["sources"]:
-                    raise ValueError(
-                        f"Source {new_source_name} not found in saved json"
-                    )
-                if cur_source_name:
-                    data["sources"][cur_source_name]["entries"] = filtered_entries
-                filtered_entries = []
-                index = 0
-                cur_source_name = new_source_name
-            elif line.startswith("d "):
-                index += 1
-            elif line.startswith("r "):
-                if not cur_source_name:
-                    raise ValueError(
-                        "Invalid input. 'r ' encountered with no preceding heading."
-                    )
-
-                filtered_entries.append(
-                    data["sources"][cur_source_name]["entries"][index]
-                )
-                index += 1
-
-        if cur_source_name:
-            data["sources"][cur_source_name]["entries"] = filtered_entries
-
-    num_urls_after_filtering = count_urls(data)
-    print(
-        f"Filtered {num_urls_before_filtering} entries down to {num_urls_after_filtering} ({num_urls_before_filtering - num_urls_after_filtering} removed)."
-    )
-    data["last_filter"] = get_time()
-    save_data(data)
-    print(f"pwr filter ended successfully at {data['last_filter']}")
+    return dataframes
 
 
 def do_status() -> None:
@@ -501,13 +421,48 @@ def do_test_fetcher(name: str, args: list[str]) -> None:
 ### Main ###
 
 if __name__ == "__main__":
+    print("Running session")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    data = do_fetch()
-    print(data)
-    df = pd.DataFrame(data, columns=["URL", "Title", "Source"])
-    new_order = ["Source", "Title", "URL"]
-    df = df[new_order]
-    selection = dataframe_with_selections(df)
-    st.write("Your selection:")
-    st.write(selection)
+    if "data" not in st.session_state:
+        st.session_state["data"] = None
+
+    if st.session_state.data is not None:
+        data = st.session_state.data
+    else:
+        data = do_fetch(
+            URLCache(Path.home() / ".local" / "share" / "pwr" / "pwr.cache")
+        )
+
+    editors = streamlit_data_editors(data)
+    st.session_state.data = data
+
+    st.subheader("Your selection:")
+
+    merged_results = pd.DataFrame()
+    if editors:
+        merged_results = editors[0]
+        for df in editors[1:]:
+            print(df)
+            print(merged_results)
+            merged_results = pd.concat([merged_results, df], ignore_index=True)
+    else:
+        sys.exit(0)
+
+    # merged_results = pd.merge([df for df in editors]) if editors else pd.DataFrame()
+    merged_results = merged_results.drop(columns=["Select"])
+    # Edit the "Title" column to include the URL as a markdown link
+    merged_results["Title"] = merged_results.apply(
+        lambda row: f'<a href="{row["URL"]}">{row["Title"]}</a>', axis=1
+    )
+
+    # Drop the "URL" column as it's now included in the "Title" column
+    merged_results = merged_results.drop(columns=["URL"])
+
+    st.markdown(
+        merged_results.style.hide(axis="index").to_html(), unsafe_allow_html=True
+    )
+
+    if st.button("Save Data"):
+        print("Saving data")
+    sys.exit(0)
