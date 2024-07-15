@@ -296,7 +296,6 @@ def do_read() -> None:
 
 def do_fetch():
     data = load_data()
-    # speedbump("fetch", data)
     total_filtered_extracted = 0
 
     all_filtered_extracted = []
@@ -356,19 +355,22 @@ def get_selected_items():
     st.write(st.session_state["all_entries"])
 
 
-def make_clickable(url, text):
-    return f'<a target="_blank" href="{url}">{text}</a>'
-
-
 def dataframe_with_selections(
     df: pd.DataFrame, init_value: bool = False
 ) -> pd.DataFrame:
     df_with_selections = df.copy()
     df_with_selections.insert(0, "Select", init_value)
 
+    original = df_with_selections.copy()
+
     # Apply the make_clickable function to the link column
     print(df_with_selections)
 
+    df_with_selections = df_with_selections[
+        df_with_selections.Source == "Rust Internals"
+    ]
+
+    st.subheader("Rust Internals")
     # Get dataframe row-selections from user with st.data_editor
     edited_df = st.data_editor(
         df_with_selections,
@@ -382,8 +384,24 @@ def dataframe_with_selections(
         on_change=get_selected_items,
     )
 
+    df_with_selections = original[original.Source == "HN"]
+    st.subheader("HN")
+    # Get dataframe row-selections from user with st.data_editor
+    edited_df_2 = st.data_editor(
+        df_with_selections,
+        key="all_entries_2",
+        hide_index=True,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(required=True),
+            "URL": st.column_config.LinkColumn(),
+        },
+        disabled=df.columns,
+        on_change=get_selected_items,
+    )
+
     # Filter the dataframe using the temporary column, then drop the column
     selected_rows = edited_df[edited_df.Select]
+    selected_rows = edited_df_2[edited_df_2.Select]
     return selected_rows.drop("Select", axis=1)
 
 
