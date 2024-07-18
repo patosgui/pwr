@@ -5,6 +5,9 @@
 # SPDX-License-Identifier: MIT
 
 import streamlit as st
+from streamlit_authenticator.authenticate import Authenticate
+import yaml
+from yaml.loader import SafeLoader
 import datetime
 import pandas as pd
 import itertools
@@ -43,18 +46,20 @@ class PWRData(TypedDict):
 # fmt: off
 def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]:
     return {
-        #"Rust Internals": (discourse_fetcher, "https://internals.rust-lang.org/"),
-        "HN": (feed_fetcher, "https://news.ycombinator.com/rss", True),
-        #"lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
+        "Hacker News": (feed_fetcher, "https://news.ycombinator.com/rss", True),
+        "CNBC": (feed_fetcher, "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
+        "lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
         "/r/programminglanguages": (feed_fetcher, "http://www.reddit.com/r/programminglanguages/.rss"),
-        "/r/rust": (feed_fetcher, "http://www.reddit.com/r/rust/top.rss?t=week"),
-        "Muxup": (feed_fetcher, "https://muxup.com/feed.xml"),
-        "Igalia": (feed_fetcher, "https://www.igalia.com/feed.xml"),
+        "/r/LLVM": (feed_fetcher, "http://www.reddit.com/r/LLVM/top.rss?t=week"),
+        "MLIR": (discourse_fetcher, "https://discourse.llvm.org/c/mlir/31"),
+        "/r/cpp": (feed_fetcher, "http://www.reddit.com/r/cpp/top.rss?t=week"),
+        "/r/LocalLLaMA": (feed_fetcher, "http://www.reddit.com/r/LocalLLaMA/top.rss?t=week"),
         "cs.PL": (arxiv_fetcher, "cs.PL"),
         "cs.AR": (arxiv_fetcher, "cs.AR"),
-        "Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
-        "RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
-        "Nim forum": (nimforum_fetcher,),
+        # TODO: Add categories
+        # TODO: Discourse MLIR
+        #"Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
+        #"RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
     }
 # fmt: on
 
@@ -155,19 +160,6 @@ def groupsio_fetcher(groupurl: str) -> URLAndTitleList:
         reply_count = reply_count_span.text.strip() if reply_count_span else "0"
         extracted.append(
             [f"{url}##{reply_count}", append_replies(title, int(reply_count))]
-        )
-    return extracted
-
-
-def nimforum_fetcher() -> URLAndTitleList:
-    thread_data = json.loads(fetch_from_url("https://forum.nim-lang.org/threads.json"))
-    extracted = []
-    for thread in thread_data["threads"]:
-        extracted.append(
-            [
-                f"https://forum.nim-lang.org/t/{thread['id']}##{thread['replies']}",
-                append_replies(thread["topic"], thread["replies"]),
-            ]
         )
     return extracted
 
@@ -294,6 +286,19 @@ def do_read() -> None:
 
 
 class URLCache:
+    """
+    A mini cache for storing URLs that have already been fetched.
+    Example:
+    {
+        "urls": {
+            "HN": [
+                "https://news.ycombinator.com/item?id=xxxxxxxx",
+                "https://news.ycombinator.com/item?id=xxxxxxxx"
+            ]
+        }
+    }
+    """
+
     filename: Path
     data: dict[str, list[str]]
     max_entries: int
@@ -301,7 +306,7 @@ class URLCache:
     def __init__(self, filename, max_entries=500):
         self.filename = filename
         self.data = dict()
-        max_entries = max_entries
+        self.max_entries = max_entries
 
         if self.filename.exists():
             print(f"Loading URLs from cache at {self.filename}")
@@ -311,19 +316,25 @@ class URLCache:
             print(f"Created new cache at {self.filename}")
             self.filename.parent.mkdir(parents=True, exist_ok=True)
             with open(self.filename, "w") as f:
-                self.data["urls"] = []
+                self.data["urls"] = {}
                 self.filename.write_text(json.dumps(self.data))
 
     def save(self) -> None:
-        self.filename.write_text(json.dumps(self.data))
+        self.filename.write_text(json.dumps(self.data, indent=4))
 
-    def add(self, url: str) -> bool:
-        if url not in self.data["urls"]:
-            self.data["urls"].append(url)
-            self.save()  # This is heavy but performance is not an issue
-            return True
+    def add(self, source, url: str) -> bool:
+        if source in self.data["urls"]:
+            url_list = self.data["urls"][source]
+            if url in url_list:
+                return False
+            if len(url_list) >= self.max_entries:
+                url_list.pop(0)
+            url_list.append(url)
+        else:
+            self.data["urls"][source] = [url]
 
-        return False
+        self.save()  # This is heavy but performance is not an issue
+        return True
 
 
 def do_fetch(url_cache: URLCache):
@@ -337,7 +348,9 @@ def do_fetch(url_cache: URLCache):
         extracted = func(*source_info[1:])
 
         filtered = [
-            [source_name, title, url] for url, title in extracted if url_cache.add(url)
+            [source_name, title, url]
+            for url, title in extracted
+            if url_cache.add(source_name, url)
         ]
 
         returned_urls.extend(filtered)
@@ -422,7 +435,32 @@ def do_test_fetcher(name: str, args: list[str]) -> None:
 
 if __name__ == "__main__":
     print("Running session")
+
+    # Create the data dir for the cache and the log in confi
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(data_dir / "config.yaml", "r") as f:
+        config = yaml.load(f, Loader=SafeLoader)
+
+    # Start the login page
+    authenticator = Authenticate(
+        config["credentials"],
+        config["cookie"]["name"],
+        config["cookie"]["key"],
+        config["cookie"]["expiry_days"],
+        config["pre-authorized"],
+    )
+    name, authentication_status, username = authenticator.login()
+
+    # Deal with bad login
+    if authentication_status is False:
+        st.error("Username/password is incorrect")
+    elif authentication_status is None:
+        st.warning("Please enter your username and password")
+
+    # Block access to the data if login failed
+    if not authentication_status:
+        sys.exit(0)
 
     if "data" not in st.session_state:
         st.session_state["data"] = None
@@ -431,23 +469,25 @@ if __name__ == "__main__":
         data = st.session_state.data
     else:
         data = do_fetch(
-            URLCache(Path.home() / ".local" / "share" / "pwr" / "pwr.cache")
+            URLCache(Path.home() / ".local" / "share" / "pwr" / "pwrcache.json")
         )
 
     editors = streamlit_data_editors(data)
     st.session_state.data = data
 
-    st.subheader("Your selection:")
+    # No new data, exit early
+    if not editors:
+        with st.chat_message("user"):
+            st.write("Hey👋! You're up to date!")
+        sys.exit(0)
 
     merged_results = pd.DataFrame()
-    if editors:
-        merged_results = editors[0]
-        for df in editors[1:]:
-            print(df)
-            print(merged_results)
-            merged_results = pd.concat([merged_results, df], ignore_index=True)
-    else:
-        sys.exit(0)
+    st.subheader("Your selection:")
+    merged_results = editors[0]
+    for df in editors[1:]:
+        print(df)
+        print(merged_results)
+        merged_results = pd.concat([merged_results, df], ignore_index=True)
 
     # merged_results = pd.merge([df for df in editors]) if editors else pd.DataFrame()
     merged_results = merged_results.drop(columns=["Select"])
@@ -462,7 +502,3 @@ if __name__ == "__main__":
     st.markdown(
         merged_results.style.hide(axis="index").to_html(), unsafe_allow_html=True
     )
-
-    if st.button("Save Data"):
-        print("Saving data")
-    sys.exit(0)
