@@ -1,0 +1,17 @@
+services:
+  news:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+     - type: bind
+       source: ${PWD}
+       target: /code
+     - data:/root/.local
+    user: root
+    ports:
+     - "3001:3001"
+    command: bash -c "cd /code && pip install -r requirements.txt --break-system-packages && CONFIG_DIR=/ streamlit run ./app.py --server.port=3001"
+
+volumes:
+  data:

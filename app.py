@@ -10,10 +10,8 @@ import yaml
 from yaml.loader import SafeLoader
 import datetime
 import pandas as pd
-import itertools
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -61,20 +59,12 @@ def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[obje
         #"Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
         #"RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
     }
-# fmt: on
-
 
 # URLs that will be opened unconditionally when performing the 'read' action.
-extra_urls_for_read = ["https://guardian.co.uk"]
-data_dir = Path(
-    os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share" / "pwr")
-)
-data_file = data_dir / "data.json"
-preferred_browser = os.environ.get("BROWSER", "firefox")
+data_dir = Path.home() / ".local" / "share" / "pwr"
 saved_seen_url_limit = 250
 fetch_timeout = 10
 read_url_batch_size = 10
-
 
 ### Fetchers ###
 
@@ -173,21 +163,6 @@ def append_replies(title: str, count: int) -> str:
     return f"{title} ({count} replies)"
 
 
-def load_data() -> PWRData:
-    # if data_file.exists():
-    #    return json.loads(data_file.read_text())  # type: ignore
-    return {
-        "last_read": "Never",
-        "last_fetch": "Never",
-        "last_filter": "Never",
-        "sources": {},
-    }
-
-
-def save_data(data: PWRData) -> None:
-    data_file.write_text(json.dumps(data, indent=2))
-
-
 def fetch_from_url(url: str, max_retries: int = 5, delay: int = 1) -> str:
     headers = {"User-Agent": "pwr - paced web reader"}
     for attempt in range(max_retries):
@@ -246,43 +221,6 @@ def count_urls(data: PWRData) -> int:
 
 
 ### Action implementations ###
-
-
-def do_read() -> None:
-    data = load_data()
-    last_action, _ = get_last_action(data)
-    speedbump("read", data)
-    if last_action != "filter":
-        print(
-            "WARNING: filter is not the most recent action. Did you forget to run it?"
-        )
-        input("Press Enter to continue anyway, or Ctrl-C to abort")
-    urls = extra_urls_for_read.copy()
-
-    for source_data in data["sources"].values():
-        for url, _ in source_data["entries"]:
-            url = url.split("##")[0]
-            if not url.startswith(("http://", "https://")):
-                print(f"Skipping url '{url}' as it doesn't have a recognised protocol")
-                continue
-            urls.append(url)
-        source_data["entries"] = []
-
-    print(
-        f"Launching browser (in batches of {read_url_batch_size}) for {len(urls)} URLs."
-    )
-
-    for url_batch in itertools.batched(urls, read_url_batch_size):
-        print(f"Opening batch of URLs with browser {preferred_browser}")
-        print(url_batch)
-        subprocess.Popen([preferred_browser] + list(url_batch))
-        if len(url_batch) == read_url_batch_size:
-            input("Press Enter to continue to next batch")
-
-    print("All URLs read, saving changes")
-    data["last_read"] = get_time()
-    save_data(data)
-    print(f"pwr read ended successfully at {data['last_read']}")
 
 
 class URLCache:
@@ -411,26 +349,6 @@ def streamlit_data_editors(df: pd.DataFrame, init_value: bool = False) -> pd.Dat
     return dataframes
 
 
-def do_status() -> None:
-    data = load_data()
-    last_action, last_action_datetime = get_last_action(data)
-    print(f"Last operation was '{last_action}' at {last_action_datetime}")
-    print(f"{count_urls(data)} items in entries database")
-
-
-def do_test_fetcher(name: str, args: list[str]) -> None:
-    fetcher_fn = globals().get(f"{name}_fetcher")
-    if not fetcher_fn or not callable(fetcher_fn):
-        print(f"Error: fetcher function '{name}' not found.")
-        sys.exit(1)
-    extracted = fetcher_fn(*args)
-    print(f"{len(extracted)} URL+title pairs extracted:\n")
-    for entry in extracted:
-        print(f"URL: {entry[0]}")
-        print(f"Title: {entry[1]}")
-        print()
-
-
 ### Main ###
 
 if __name__ == "__main__":
@@ -439,7 +357,9 @@ if __name__ == "__main__":
     # Create the data dir for the cache and the log in confi
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(data_dir / "config.yaml", "r") as f:
+    config_dir = Path(os.environ["CONFIG_DIR"]) if os.getenv("CONFIG_DIR", None) else data_dir 
+    print("Searching for login data in " + str(config_dir))
+    with open(config_dir / "config.yaml", "r") as f:
         config = yaml.load(f, Loader=SafeLoader)
 
     # Start the login page
