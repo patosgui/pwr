@@ -369,6 +369,10 @@ def save(data, file: Path):
     json_data : dict[str, dict[str,list[str]]] = dict()
     json_data["urls"] = {}
 
+    if data.empty:
+        file.write_text(json.dumps(json_data, indent=4))
+        return
+
     sources = data["Source"].unique()
     for source in sources:
         source_df = data[data.Source == source].copy()
@@ -438,17 +442,17 @@ if __name__ == "__main__":
 
     save(data, state_file)
 
-    editors = streamlit_data_editors(data)
-    st.session_state.data = data
-
     # No new data, exit early
-    if not editors:
+    if data.empty:
         with st.chat_message("user"):
             st.write("Hey👋! You're up to date!")
         sys.stdout.flush()
         sys.stderr.flush()
         sys.exit(0)
 
+    st.session_state.data = data
+
+    editors = streamlit_data_editors(data)
 
     merged_results = pd.DataFrame()
     st.subheader("Your selection:")
