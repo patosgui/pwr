@@ -167,17 +167,17 @@ def fetch_from_url(url: str, max_retries: int = 5, delay: int = 1) -> str:
     headers = {"User-Agent": "pwr - paced web reader"}
     for attempt in range(max_retries):
         try:
-            print(f"Fetching {url} ...", end="", flush=True)
+            print(f"Fetching {url}...", end="", flush=True)
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
-            print("DONE")
+            print(" Done", flush=True)
             return response.text
         except requests.exceptions.HTTPError as e:
-            print(f"FAILED {str(e)}")
+            print(f" Failed {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(delay)
                 delay *= 4
-    print("Max retries reached. Giving up.")
+    print("Max retries reached. Giving up.", flush=True)
     sys.exit(1)
 
 
@@ -348,11 +348,42 @@ def streamlit_data_editors(df: pd.DataFrame, init_value: bool = False) -> pd.Dat
 
     return dataframes
 
+def load(file: Path):
+    if not file.exists():
+        return None
+
+    with open(file, "r") as f:
+        data =  json.load(f)
+    result = pd.DataFrame()
+
+    for source, entry in data["urls"].items():
+        for e in entry:
+            e["Source"] = source
+        df = pd.DataFrame(entry)
+        result = pd.concat([result, df], ignore_index=True)
+
+    return result
+        
+
+def save(data, file: Path):
+    json_data : dict[str, dict[str,list[str]]] = dict()
+    json_data["urls"] = {}
+
+    sources = data["Source"].unique()
+    for source in sources:
+        source_df = data[data.Source == source].copy()
+        source_df = source_df.drop(columns=["Source"])
+        json_data["urls"][source] = source_df.to_dict("records")
+    
+    file.write_text(json.dumps(json_data, indent=4))
 
 ### Main ###
 
 if __name__ == "__main__":
     print("Running session")
+
+    state_file = Path.home() / ".local" / "share" / "pwr" / "state.json"
+    cache_file = Path.home() / ".local" / "share" / "pwr" / "pwrcache.json"
 
     # Create the data dir for the cache and the log in confi
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -385,12 +416,27 @@ if __name__ == "__main__":
     if "data" not in st.session_state:
         st.session_state["data"] = None
 
-    if st.session_state.data is not None:
-        data = st.session_state.data
-    else:
+    data = None
+
+    # Only update data upon explicit user request
+    if st.button('Refresh Data'):
         data = do_fetch(
-            URLCache(Path.home() / ".local" / "share" / "pwr" / "pwrcache.json")
+            URLCache(cache_file)
         )
+
+    if data is None:
+        if st.session_state.data is None:
+            data = load(state_file)
+            if data is None:
+                data = do_fetch(
+                    URLCache(cache_file)
+                )
+        else:
+            data = st.session_state.data
+        
+    assert data is not None, "Data is none!"
+
+    save(data, state_file)
 
     editors = streamlit_data_editors(data)
     st.session_state.data = data
@@ -399,7 +445,10 @@ if __name__ == "__main__":
     if not editors:
         with st.chat_message("user"):
             st.write("Hey👋! You're up to date!")
+        sys.stdout.flush()
+        sys.stderr.flush()
         sys.exit(0)
+
 
     merged_results = pd.DataFrame()
     st.subheader("Your selection:")
@@ -408,6 +457,7 @@ if __name__ == "__main__":
         print(df)
         print(merged_results)
         merged_results = pd.concat([merged_results, df], ignore_index=True)
+
 
     # merged_results = pd.merge([df for df in editors]) if editors else pd.DataFrame()
     merged_results = merged_results.drop(columns=["Select"])
@@ -422,3 +472,6 @@ if __name__ == "__main__":
     st.markdown(
         merged_results.style.hide(axis="index").to_html(), unsafe_allow_html=True
     )
+
+    sys.stdout.flush()
+    sys.stderr.flush()
