@@ -39,26 +39,33 @@ class PWRData(TypedDict):
 
 ### Config ###
 
-# Wrapped in a function to workaround Python's lack of support for forward
-# declarations of functions (such as the referenced fetcher functions)
-# fmt: off
-def get_sources() -> dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]:
+
+def get_sources() -> (
+    dict[str, tuple[Callable[..., URLAndTitleList], *tuple[object, ...]]]
+):
     return {
         "Hacker News": (feed_fetcher, "https://news.ycombinator.com/rss", True),
-        "CNBC": (feed_fetcher, "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
+        "CNBC": (
+            feed_fetcher,
+            "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362",
+        ),
+        "Publico": (feed_fetcher, "https://feeds.feedburner.com/PublicoRSS"),
         "lobste.rs": (feed_fetcher, "https://lobste.rs/rss", True),
-        "/r/programminglanguages": (feed_fetcher, "http://www.reddit.com/r/programminglanguages/.rss"),
+        "/r/programminglanguages": (
+            feed_fetcher,
+            "http://www.reddit.com/r/programminglanguages/.rss",
+        ),
         "/r/LLVM": (feed_fetcher, "http://www.reddit.com/r/LLVM/top.rss?t=week"),
         "MLIR": (discourse_fetcher, "https://discourse.llvm.org/c/mlir/31"),
         "/r/cpp": (feed_fetcher, "http://www.reddit.com/r/cpp/top.rss?t=week"),
-        "/r/LocalLLaMA": (feed_fetcher, "http://www.reddit.com/r/LocalLLaMA/top.rss?t=week"),
+        "/r/LocalLLaMA": (
+            feed_fetcher,
+            "http://www.reddit.com/r/LocalLLaMA/top.rss?t=week",
+        ),
         "cs.PL": (arxiv_fetcher, "cs.PL"),
         "cs.AR": (arxiv_fetcher, "cs.AR"),
-        # TODO: Add categories
-        # TODO: Discourse MLIR
-        #"Hylo discussions": (ghdiscussions_fetcher, "orgs/hylo-lang"),
-        #"RISC-V announcements": (groupsio_fetcher, "https://lists.riscv.org/g/tech-announce/topics"),
     }
+
 
 # URLs that will be opened unconditionally when performing the 'read' action.
 data_dir = Path.home() / ".local" / "share" / "pwr"
@@ -348,12 +355,13 @@ def streamlit_data_editors(df: pd.DataFrame, init_value: bool = False) -> pd.Dat
 
     return dataframes
 
+
 def load(file: Path):
     if not file.exists():
         return None
 
     with open(file, "r") as f:
-        data =  json.load(f)
+        data = json.load(f)
     result = pd.DataFrame()
 
     for source, entry in data["urls"].items():
@@ -363,10 +371,10 @@ def load(file: Path):
         result = pd.concat([result, df], ignore_index=True)
 
     return result
-        
+
 
 def save(data, file: Path):
-    json_data : dict[str, dict[str,list[str]]] = dict()
+    json_data: dict[str, dict[str, list[str]]] = dict()
     json_data["urls"] = {}
 
     if data.empty:
@@ -378,8 +386,9 @@ def save(data, file: Path):
         source_df = data[data.Source == source].copy()
         source_df = source_df.drop(columns=["Source"])
         json_data["urls"][source] = source_df.to_dict("records")
-    
+
     file.write_text(json.dumps(json_data, indent=4))
+
 
 ### Main ###
 
@@ -392,7 +401,9 @@ if __name__ == "__main__":
     # Create the data dir for the cache and the log in confi
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    config_dir = Path(os.environ["CONFIG_DIR"]) if os.getenv("CONFIG_DIR", None) else data_dir 
+    config_dir = (
+        Path(os.environ["CONFIG_DIR"]) if os.getenv("CONFIG_DIR", None) else data_dir
+    )
     print("Searching for login data in " + str(config_dir))
     with open(config_dir / "config.yaml", "r") as f:
         config = yaml.load(f, Loader=SafeLoader)
@@ -423,21 +434,17 @@ if __name__ == "__main__":
     data = None
 
     # Only update data upon explicit user request
-    if st.button('Refresh Data'):
-        data = do_fetch(
-            URLCache(cache_file)
-        )
+    if st.button("Refresh Data"):
+        data = do_fetch(URLCache(cache_file))
 
     if data is None:
         if st.session_state.data is None:
             data = load(state_file)
             if data is None:
-                data = do_fetch(
-                    URLCache(cache_file)
-                )
+                data = do_fetch(URLCache(cache_file))
         else:
             data = st.session_state.data
-        
+
     assert data is not None, "Data is none!"
 
     save(data, state_file)
@@ -461,7 +468,6 @@ if __name__ == "__main__":
         print(df)
         print(merged_results)
         merged_results = pd.concat([merged_results, df], ignore_index=True)
-
 
     # merged_results = pd.merge([df for df in editors]) if editors else pd.DataFrame()
     merged_results = merged_results.drop(columns=["Select"])
