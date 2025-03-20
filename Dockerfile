@@ -7,3 +7,4 @@ EXPOSE 3001
 
 RUN mkdir -p /root/.local/share/pwr/
 COPY config.yaml /config.yaml
+COPY claude-key.txt /claude-key.txt
