@@ -236,11 +236,11 @@ def extract_article_content(url: str) -> str:
         return f"Error extracting content: {str(e)}"
 
 
-def summarize_with_claude(content: str, title: str) -> str:
+def summarize_with_claude(content: str, title: str, claude_api_key: str | None) -> str:
     """Summarize the article content using Claude API"""
     try:
         # Get API key from environment or config
-        api_key = os.environ.get("CLAUDE_API_KEY", "")
+        api_key = claude_api_key
         if not api_key:
             return (
                 "Claude API key not found. Set the CLAUDE_API_KEY environment variable."
@@ -355,20 +355,63 @@ def get_selected_items(key: str):
     st.write(st.session_state[key])
 
 
-def summarize_article_callback(url: str, title: str):
+def summarize_article_callback(url: str, title: str, claude_api_key: str | None):
     """Callback function for the summarize button"""
     with st.spinner(f"Summarizing article: {title[:30]}..."):
         # Get article content
         content = extract_article_content(url)
 
         # Summarize with Claude
-        summary = summarize_with_claude(content, title)
+        summary = summarize_with_claude(content, title, claude_api_key)
 
         # Store summary in session state to persist between reruns
         if "summaries" not in st.session_state:
             st.session_state.summaries = {}
 
         st.session_state.summaries[url] = summary
+
+
+def summarize_source_callback(
+    source: str, articles: list[tuple[str, str]], claude_api_key: str | None
+):
+    """Callback function for summarizing all articles from a source"""
+    with st.spinner(f"Summarizing all articles from {source}..."):
+        # Initialize source summaries in session state if not exists
+        if "source_summaries" not in st.session_state:
+            st.session_state.source_summaries = {}
+
+        # Collect all article summaries
+        all_summaries = []
+        for url, title in articles:
+            # If we don't have a summary for this article yet, get one
+            if url not in st.session_state.summaries:
+                content = extract_article_content(url)
+                summary = summarize_with_claude(content, title, claude_api_key)
+                st.session_state.summaries[url] = summary
+            all_summaries.append(st.session_state.summaries[url])
+
+        # Create a prompt for Claude to summarize all the summaries
+        prompt = f"""
+        Create a concise summary of the following news articles from {source}. 
+        Focus on the main themes, trends, and key takeaways across all articles:
+
+        {'\n\n'.join(all_summaries)}
+        """
+
+        try:
+            client = anthropic.Anthropic(api_key=claude_api_key)
+            message = client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=1000,
+                temperature=0.0,
+                system="You are a helpful assistant that creates concise summaries of multiple news articles, focusing on common themes and key takeaways.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            st.session_state.source_summaries[source] = message.content[0].text
+        except Exception as e:
+            st.session_state.source_summaries[
+                source
+            ] = f"Error generating source summary: {str(e)}"
 
 
 def streamlit_data_editors(df: pd.DataFrame) -> pd.DataFrame:
@@ -380,6 +423,8 @@ def streamlit_data_editors(df: pd.DataFrame) -> pd.DataFrame:
     # Initialize summaries in session state if not exists
     if "summaries" not in st.session_state:
         st.session_state.summaries = {}
+    if "source_summaries" not in st.session_state:
+        st.session_state.source_summaries = {}
 
     # Apply the make_clickable function to the link column
     logger.debug(f"DataFrame contents:\n{df}")
@@ -389,6 +434,17 @@ def streamlit_data_editors(df: pd.DataFrame) -> pd.DataFrame:
         st.subheader(source)
 
         source_df = df.query("Source == @source").drop(columns=["Source"])
+
+        # Add "Summarize All" button for this source
+        if st.button(f"Summarize All {source} Articles", key=f"summarize_all_{source}"):
+            # Get list of (url, title) tuples for this source
+            articles = list(zip(source_df["URL"], source_df["Title"]))
+            summarize_source_callback(source, articles, claude_api_key)
+
+        # Display source summary if it exists
+        if source in st.session_state.source_summaries:
+            with st.expander(f"View {source} Summary", expanded=True):
+                st.markdown(st.session_state.source_summaries[source])
 
         # Add buttons separately for each row
         for i, row in source_df.iterrows():
@@ -410,7 +466,8 @@ def streamlit_data_editors(df: pd.DataFrame) -> pd.DataFrame:
                 with col2:
                     # Create a button for this article
                     if st.button("Summarize with Claude", key=button_key):
-                        summarize_article_callback(url, title)
+                        assert claude_api_key
+                        summarize_article_callback(url, title, claude_api_key)
 
                 # If we have a summary for this URL, display it
                 if url in st.session_state.summaries:
@@ -509,9 +566,12 @@ if __name__ == "__main__":
     # Datafram with Title, URL, Source, Summary
     data = None
 
-    # Only update data upon explicit user request
-    if st.button("Refresh Data"):
-        data = do_fetch(URLCache(cache_file))
+    _, right_col = st.columns([3, 1])
+
+    with right_col:
+        # Only update data upon explicit user request
+        if st.button("Refresh Data"):
+            data = do_fetch(URLCache(cache_file))
 
     if data is None:
         if st.session_state.data is None:
