@@ -8,18 +8,26 @@ import streamlit as st
 from streamlit_authenticator.authenticate import Authenticate
 import yaml
 from yaml.loader import SafeLoader
-import datetime
 import pandas as pd
 import json
 import os
 import sys
 import time
+import logging
 from pathlib import Path
 from typing import Callable, TypedDict
 
 import requests
 from bs4 import BeautifulSoup
 import anthropic
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("pwr.log")],
+)
+logger = logging.getLogger(__name__)
 
 ### Type definitions ###
 
@@ -179,17 +187,17 @@ def fetch_from_url(url: str, max_retries: int = 5, delay: int = 1) -> str:
     headers = {"User-Agent": "pwr - paced web reader"}
     for attempt in range(max_retries):
         try:
-            print(f"Fetching {url}...", end="", flush=True)
+            logger.info(f"Fetching {url}...")
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
-            print(" Done", flush=True)
+            logger.info("Done")
             return response.text
         except requests.exceptions.HTTPError as e:
-            print(f" Failed {str(e)}")
+            logger.error(f"Failed {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(delay)
                 delay *= 4
-    print("Max retries reached. Giving up.", flush=True)
+    logger.error("Max retries reached. Giving up.")
     sys.exit(1)
 
 
@@ -224,7 +232,7 @@ def extract_article_content(url: str) -> str:
         )
         return content
     except Exception as e:
-        print(f"Error extracting content from {url}: {str(e)}")
+        logger.error(f"Error extracting content from {url}: {str(e)}")
         return f"Error extracting content: {str(e)}"
 
 
@@ -261,48 +269,6 @@ def summarize_with_claude(content: str, title: str) -> str:
         return f"Error generating summary: {str(e)}"
 
 
-def get_time() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
-def print_help() -> None:
-    print("Usage: pwr [action]")
-    print("\nIf no action is given, cycles through read/fetch/filter in sequence.\n")
-    print("Available actions:")
-    print("  read   - Read previously selected/enqueued URls")
-    print("  fetch  - Retrieve new article titles for review")
-    print("  filter - Review article titles and decide which to read")
-    print("  status - Print information about current status")
-
-
-def speedbump(action_name: str, data: PWRData) -> None:
-    print(f"About to start pwr {action_name}, last run at: {data['last_'+action_name]}")  # type: ignore
-    input(f"Press Enter to continue with pwr {action_name}")
-
-
-def get_last_action(data: PWRData) -> tuple[str, str]:
-    def date_str_for_op(key: str) -> str:
-        val = data[key]  # type: ignore
-        if val == "Never":
-            return "1970-01-01 00:00:00 UTC"
-        return val  # type: ignore
-
-    recent_ops = [
-        ("read", date_str_for_op("last_read")),
-        ("fetch", date_str_for_op("last_fetch")),
-        ("filter", date_str_for_op("last_filter")),
-    ]
-    last_action, last_action_datetime = max(recent_ops, key=lambda x: x[1])
-    return (last_action, last_action_datetime)
-
-
-def count_urls(data: PWRData) -> int:
-    return sum(len(source_data["entries"]) for source_data in data["sources"].values())
-
-
-### Action implementations ###
-
-
 class URLCache:
     """
     A mini cache for storing URLs that have already been fetched.
@@ -327,11 +293,11 @@ class URLCache:
         self.max_entries = max_entries
 
         if self.filename.exists():
-            print(f"Loading URLs from cache at {self.filename}")
+            logger.info(f"Loading URLs from cache at {self.filename}")
             with open(self.filename, "r") as f:
                 self.data = json.load(f)
         else:
-            print(f"Created new cache at {self.filename}")
+            logger.info(f"Created new cache at {self.filename}")
             self.filename.parent.mkdir(parents=True, exist_ok=True)
             with open(self.filename, "w") as f:
                 self.data["urls"] = {}
@@ -360,7 +326,7 @@ def do_fetch(url_cache: URLCache):
     returned_urls: list[list[str]] = []
     total_filtered_extracted = 0
     for source_name, source_info in get_sources().items():
-        print(f"Processing source {source_name}")
+        logger.info(f"Processing source {source_name}")
 
         func = source_info[0]
         extracted = func(*source_info[1:])
@@ -373,11 +339,11 @@ def do_fetch(url_cache: URLCache):
 
         returned_urls.extend(filtered)
         total_filtered_extracted += len(filtered)
-        print(
+        logger.info(
             f"Retrieved {len(extracted)} items, {len(filtered)} remain after removing seen items"
         )
 
-    print(
+    logger.info(
         f"\nA total of {total_filtered_extracted} items were queued up for filtering."
     )
 
@@ -416,7 +382,7 @@ def streamlit_data_editors(df: pd.DataFrame) -> pd.DataFrame:
         st.session_state.summaries = {}
 
     # Apply the make_clickable function to the link column
-    print(df)
+    logger.debug(f"DataFrame contents:\n{df}")
 
     for source in sources:
         # Make a subheader for each source
@@ -492,11 +458,11 @@ def save(data, file: Path):
 ### Main ###
 
 if __name__ == "__main__":
-    print("Running session")
+    logger.info("Running session")
 
     state_file = Path.home() / ".local" / "share" / "pwr" / "state.json"
     cache_file = Path.home() / ".local" / "share" / "pwr" / "pwrcache.json"
-    print(cache_file)
+    logger.debug(f"Cache file path: {cache_file}")
 
     # Create the data dir for the cache and the log in confi
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -504,7 +470,7 @@ if __name__ == "__main__":
     config_dir = (
         Path(os.environ["CONFIG_DIR"]) if os.getenv("CONFIG_DIR", None) else data_dir
     )
-    print("Searching for login data in " + str(config_dir))
+    logger.info(f"Searching for login data in {config_dir}")
     with open(config_dir / "config.yaml", "r") as f:
         config = yaml.load(f, Loader=SafeLoader)
 
@@ -513,7 +479,7 @@ if __name__ == "__main__":
         claude_api_key = f.read().strip()
 
     if not claude_api_key:
-        st.warning(
+        logger.warning(
             "Claude API key not found. Set the CLAUDE_API_KEY environment variable to enable article summarization."
         )
 
